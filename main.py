@@ -5,9 +5,10 @@ import os
 import random
 import argparse
 import numpy as np
+import json
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
+from datasets import VOCSegmentation, Cityscapes, my_dataset, cityscapes_mod
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
 
@@ -27,7 +28,7 @@ def get_argparser():
     parser.add_argument("--data_root", type=str, default='./datasets/data',
                         help="path to Dataset")
     parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of dataset')
+                        choices=['voc', 'cityscapes', 'my'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
 
@@ -150,6 +151,29 @@ def get_dataset(opts):
                                split='train', transform=train_transform)
         val_dst = Cityscapes(root=opts.data_root,
                              split='val', transform=val_transform)
+
+    if opts.dataset == 'my':
+        train_transform = et.ExtCompose([
+            # et.ExtResize( 512 ),
+            et.ExtRandomCrop(size=(96, 256)),
+            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
+            et.ExtRandomHorizontalFlip(),
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        val_transform = et.ExtCompose([
+            # et.ExtResize( 512 ),
+            et.ExtRandomCrop(size=(96, 256)),
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        train_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='train', transform=train_transform)
+        val_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='val', transform=val_transform)
+
     return train_dst, val_dst
 
 
@@ -214,6 +238,8 @@ def main():
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
+    elif opts.dataset.lower() == 'my':
+        opts.num_classes = 19
 
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
@@ -264,12 +290,34 @@ def main():
     elif opts.lr_policy == 'step':
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
 
+    # === Calcolo automatico dei pesi di classe ===
+    print("Calcolo pesi per CrossEntropyLoss...")
+
+    class_counts = torch.zeros(opts.num_classes)
+    total_pixels = 0
+
+    tmp_loader = data.DataLoader(train_dst, batch_size=1, shuffle=False)
+
+    for _, label in tqdm(tmp_loader, desc="Scanning dataset"):
+        label = label.squeeze()  # [H, W]
+        for cls in range(opts.num_classes):
+            class_counts[cls] += torch.sum(label == cls).item()
+        total_pixels += label.numel()
+
+    # Frequenza inversa normalizzata
+    class_freq = class_counts / total_pixels
+    weights = 1.0 / (class_freq + 1e-6)  # evita divisione per zero
+    weights = weights / weights.sum() * opts.num_classes  # normalizzazione (opzionale)
+
+    print("Class weights:", weights)
+    weights = weights.to(device)
+
     # Set up criterion
     # criterion = utils.get_loss(opts.loss_type)
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = nn.CrossEntropyLoss(ignore_index=255, weight=weights, reduction='mean')
 
     def save_ckpt(path):
         """ save current model
@@ -291,9 +339,21 @@ def main():
     if opts.ckpt is not None and os.path.isfile(opts.ckpt):
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint["model_state"])
+        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+        # Carica solo i pesi del backbone e del resto tranne la testa
+        state_dict = checkpoint['model_state']
+        filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
+        model.load_state_dict(filtered_dict, strict=False)
+
+        # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
         model = nn.DataParallel(model)
         model.to(device)
+
+        optimizer = torch.optim.SGD(params=[
+            {'params': model.module.backbone.parameters(), 'lr': 0.001},
+            {'params': model.module.classifier.parameters(), 'lr': 0.01},
+        ], lr=0.01, momentum=0.9, weight_decay=opts.weight_decay)
+
         if opts.continue_training:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -301,6 +361,7 @@ def main():
             best_score = checkpoint['best_score']
             print("Training state restored from %s" % opts.ckpt)
         print("Model restored from %s" % opts.ckpt)
+        print(f"Cur itrs: {cur_itrs}, Total itrs: {opts.total_itrs}")
         del checkpoint  # free memory
     else:
         print("[!] Retrain")
