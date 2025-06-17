@@ -20,6 +20,59 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+import cv2
+import numpy as np
+
+class BoundaryAwareCrossEntropyLoss(nn.Module):
+    def __init__(self, weight=None, ignore_index=255, boundary_weight=10.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index)
+        self.boundary_weight = boundary_weight
+        self.ignore_index = ignore_index
+
+    def forward(self, input, target):
+        loss = self.ce(input, target)
+        target_np = target.detach().cpu().numpy()
+        boundary_mask = np.zeros_like(target_np, dtype=np.uint8)
+
+        for i in range(target_np.shape[0]):
+            label = target_np[i]
+            edge = cv2.Canny((label * 255).astype(np.uint8), 50, 150)
+            boundary_mask[i] = (edge > 0).astype(np.uint8)
+
+        boundary_mask = torch.tensor(boundary_mask).to(target.device).bool()
+        loss_boundary = F.cross_entropy(input, target, weight=self.ce.weight, 
+                                      ignore_index=self.ignore_index, reduction='none')
+        if loss_boundary[boundary_mask].numel() > 0:
+            loss += self.boundary_weight * loss_boundary[boundary_mask].mean()
+        return loss
+
+def calibra_soglia_confidenza(model, loader, device, percentile=10):
+    """Stima una soglia di confidenza MSP con conformal prediction (percentile su pixel corretti)."""
+    print("[INFO] Calibrazione soglia conformal prediction...")
+    model.eval()
+    conf_list = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(loader, desc="Calibrazione CP"):
+            images = images.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.long)
+
+            outputs = model(images)
+            softmax = torch.nn.functional.softmax(outputs, dim=1)
+            confidence, preds = torch.max(softmax, dim=1)  # [B, H, W]
+
+            correct = preds.eq(labels).cpu().numpy()
+            conf_np = confidence.cpu().numpy()
+
+            conf_list.extend(conf_np[correct])  # solo confidenza sui pixel corretti
+
+    threshold = np.percentile(conf_list, percentile)
+    print(f"[INFO] Soglia CP al {100 - percentile}% di affidabilità: {threshold:.3f}")
+    return threshold
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -67,7 +120,7 @@ def get_argparser():
     parser.add_argument("--continue_training", action='store_true', default=False)
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+                        choices=['cross_entropy', 'focal_loss', 'boundary'], help="loss type (default: False)")
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -154,13 +207,14 @@ def get_dataset(opts):
 
     if opts.dataset == 'my':
         train_transform = et.ExtCompose([
-            # et.ExtResize( 512 ),
-            et.ExtRandomCrop(size=(96, 256)),
-            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
-            et.ExtRandomHorizontalFlip(),
+            et.ExtResize((96, 256)),
+            et.ExtRandomCrop(size=(96, 256), pad_if_needed=True),
+            et.ExtColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+            et.ExtRandomHorizontalFlip(p=0.5),
+            et.ExtRandomVerticalFlip(p=0.2),
+            #et.ExtGaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
             et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
         val_transform = et.ExtCompose([
@@ -188,6 +242,9 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                                    std=[0.229, 0.224, 0.225])
         img_id = 0
 
+    threshold = getattr(opts, 'calibrated_threshold', 0.2)  # soglia per considerare un pixel come "unknown"
+    unknown_label = opts.num_classes - 1  # ultima classe = unknown
+
     with torch.no_grad():
         for i, (images, labels) in tqdm(enumerate(loader)):
 
@@ -195,37 +252,64 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
             labels = labels.to(device, dtype=torch.long)
 
             outputs = model(images)
-            preds = outputs.detach().max(dim=1)[1].cpu().numpy()
+            softmax = torch.nn.functional.softmax(outputs, dim=1)
+            confidence, _ = torch.max(softmax, dim=1)  # [B, H, W]
+            preds = outputs.detach().max(dim=1)[1]     # [B, H, W]
+
+            # Etichetta i pixel con bassa confidenza come "unknown"
+            unknown_mask = confidence < threshold
+            preds[unknown_mask] = unknown_label
+            num_unknown = unknown_mask.sum().item()
+            total_pixels = unknown_mask.numel()
+            perc_unknown = 100 * num_unknown / total_pixels
+            print(f"[DEBUG] Unknown pixels: {num_unknown} ({perc_unknown:.2f}%)")
+
+            preds_np = preds.cpu().numpy()
             targets = labels.cpu().numpy()
 
-            metrics.update(targets, preds)
-            if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
+            # FILTRAGGIO: ignora i pixel 'unknown' nel calcolo metriche
+            valid_mask = targets != unknown_label  # True dove target != unknown
+
+            # Appiattisci e filtra solo pixel validi (batch, h, w → vettore)
+            targets_filtered = targets[valid_mask]
+            preds_filtered = preds_np[valid_mask]
+
+            metrics.update(targets_filtered, preds_filtered)
+
+            if ret_samples_ids is not None and i in ret_samples_ids:
                 ret_samples.append(
-                    (images[0].detach().cpu().numpy(), targets[0], preds[0]))
+                    (images[0].detach().cpu().numpy(), targets[0], preds_np[0]))
 
             if opts.save_val_results:
-                for i in range(len(images)):
-                    image = images[i].detach().cpu().numpy()
-                    target = targets[i]
-                    pred = preds[i]
+                for j in range(len(images)):  # correggo da i a j per evitare sovrascrittura ciclo
+                    image = images[j].detach().cpu().numpy()
+                    target = targets[j]
+                    pred = preds_np[j]
+                    conf_map = confidence[j].cpu().numpy()
+                    unk_mask = unknown_mask[j].cpu().numpy()
 
                     image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
-                    target = loader.dataset.decode_target(target).astype(np.uint8)
-                    pred = loader.dataset.decode_target(pred).astype(np.uint8)
+                    target_vis = loader.dataset.decode_target(target).astype(np.uint8)
+                    pred_vis = loader.dataset.decode_target(pred).astype(np.uint8)
 
-                    Image.fromarray(image).save('results/%d_image.png' % img_id)
-                    Image.fromarray(target).save('results/%d_target.png' % img_id)
-                    Image.fromarray(pred).save('results/%d_pred.png' % img_id)
-
-                    fig = plt.figure()
-                    plt.imshow(image)
-                    plt.axis('off')
-                    plt.imshow(pred, alpha=0.7)
-                    ax = plt.gca()
-                    ax.xaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    ax.yaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    plt.savefig('results/%d_overlay.png' % img_id, bbox_inches='tight', pad_inches=0)
+                    # Heatmap confidenza
+                    plt.imshow(conf_map, cmap='hot')
+                    plt.colorbar()
+                    plt.title("Confidence Heatmap")
+                    plt.savefig(f'results/{img_id}_conf_heatmap.png')
                     plt.close()
+
+                    # Overlay ostacoli sconosciuti
+                    overlay = np.zeros_like(image)
+                    overlay[unk_mask] = [255, 0, 0]
+                    blend = np.clip(0.6 * image + 0.4 * overlay, 0, 255).astype(np.uint8)
+
+                    # Salvataggio immagini
+                    Image.fromarray(image).save(f'results/{img_id}_image.png')
+                    Image.fromarray(target_vis).save(f'results/{img_id}_target.png')
+                    Image.fromarray(pred_vis).save(f'results/{img_id}_pred.png')
+                    Image.fromarray(blend).save(f'results/{img_id}_unknown_overlay.png')
+
                     img_id += 1
 
         score = metrics.get_results()
@@ -239,7 +323,7 @@ def main():
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
     elif opts.dataset.lower() == 'my':
-        opts.num_classes = 19
+        opts.num_classes = 19 + 1
 
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
@@ -318,6 +402,8 @@ def main():
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
         criterion = nn.CrossEntropyLoss(ignore_index=255, weight=weights, reduction='mean')
+    elif opts.loss_type == 'boundary':
+        criterion = BoundaryAwareCrossEntropyLoss(weight=weights, ignore_index=255, boundary_weight=5.0)
 
     def save_ckpt(path):
         """ save current model
@@ -374,9 +460,14 @@ def main():
     denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
 
     if opts.test_only:
+        # Calibrazione soglia CP
+        threshold_cp = calibra_soglia_confidenza(model, val_loader, device, percentile=10)
+        opts.calibrated_threshold = threshold_cp
+
         model.eval()
         val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+            opts=opts, model=model, loader=val_loader, device=device,
+            metrics=metrics, ret_samples_ids=vis_sample_id)
         print(metrics.to_str(val_score))
         return
 

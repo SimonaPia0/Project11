@@ -58,12 +58,14 @@ class Cityscapes_Mod(data.Dataset):
         CityscapesClass('motorcycle',           32, 17, 'vehicle', 7, True, False, (0, 0, 230)),
         CityscapesClass('bicycle',              33, 18, 'vehicle', 7, True, False, (119, 11, 32)),
         CityscapesClass('license plate',        -1, 255, 'vehicle', 7, False, True, (0, 0, 142)),
+        CityscapesClass('unknown',              255, 20, 'void', 0, False, False, (255, 0, 0)),  # rosso per unknown
     ]
 
     train_id_to_color = [c.color for c in classes if (c.train_id != -1 and c.train_id != 255)]
     train_id_to_color.append([0, 0, 0])
     train_id_to_color = np.array(train_id_to_color)
     id_to_train_id = np.array([c.train_id for c in classes])
+
 
     # Mappa completa da 0 a 255 (per tutti i possibili valori pixel)
     full_id_to_train_id = np.ones(256, dtype=np.uint8) * 255  # inizializza tutto a 255 (ignora)
