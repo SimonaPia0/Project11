@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import cv2
-import numpy as np
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
 class BoundaryAwareCrossEntropyLoss(nn.Module):
     def __init__(self, weight=None, ignore_index=255, boundary_weight=10.0):
@@ -69,6 +69,10 @@ def calibra_soglia_confidenza(model, loader, device, percentile=10):
             conf_np = confidence.cpu().numpy()
 
             conf_list.extend(conf_np[correct])  # solo confidenza sui pixel corretti
+
+    if len(conf_list) == 0:
+        print("[WARNING] Nessuna confidenza raccolta (conf_list è vuoto). Restituisco soglia di default = 0.5")
+        return 0.5
 
     threshold = np.percentile(conf_list, percentile)
     print(f"[INFO] Soglia CP al {100 - percentile}% di affidabilità: {threshold:.3f}")
@@ -374,6 +378,11 @@ def main():
     else:
         val_loader = data.DataLoader(
             val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        
+    if len(val_loader) == 0:
+        print("[!] Val loader is empty!")
+        return
+
     print("Dataset: %s, Train set: %s, Val set: %d" % (
     opts.dataset,
     len(train_dst) if train_dst is not None else 'N/A',
@@ -459,16 +468,25 @@ def main():
     cur_epochs = 0
     if opts.ckpt is not None and os.path.isfile(opts.ckpt):
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
-        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
-        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
-        # Carica solo i pesi del backbone e del resto tranne la testa
-        state_dict = checkpoint['model_state']
-        filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
-        model.load_state_dict(filtered_dict, strict=False)
+        
 
-        # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
-        model = nn.DataParallel(model)
-        model.to(device)
+        if opts.dataset.lower() == 'lostandfound':
+            checkpoint = torch.load(opts.ckpt, map_location=device)
+            model.load_state_dict(checkpoint['model_state'], strict=True)
+            model = nn.DataParallel(model)
+            model.to(device)
+        else:
+            checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
+            model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+            # Carica solo i pesi del backbone e del resto tranne la testa
+            state_dict = checkpoint['model_state']
+            filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
+            model.load_state_dict(filtered_dict, strict=False)
+
+            # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
+            model = nn.DataParallel(model)
+            model.to(device)
+
 
         optimizer = torch.optim.SGD(params=[
             {'params': model.module.backbone.parameters(), 'lr': 0.001},
@@ -504,9 +522,6 @@ def main():
             opts=opts, model=model, loader=val_loader, device=device,
             metrics=metrics, ret_samples_ids=vis_sample_id)
         print(metrics.to_str(val_score))
-
-        import numpy as np
-        from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
         all_pred_scores = []
         all_gt_labels = []

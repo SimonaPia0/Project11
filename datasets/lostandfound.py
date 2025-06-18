@@ -78,19 +78,23 @@ def decode_target(train_id_mask):
 
 class LostAndFoundFromZip(Dataset):
     def __init__(self, img_zip_path, ann_zip_path, split='test', transform=None):
-        self.img_zip = zipfile.ZipFile(img_zip_path, 'r')
-        self.ann_zip = zipfile.ZipFile(ann_zip_path, 'r')
+        self.img_zip_path = img_zip_path
+        self.ann_zip_path = ann_zip_path
         self.transform = transform
         self.split = split
         self.samples = []
 
-        # Build list of image and annotation pairs
-        for name in self.img_zip.namelist():
+        with zipfile.ZipFile(self.img_zip_path, 'r') as img_zip:
+            img_files = img_zip.namelist()
+        with zipfile.ZipFile(self.ann_zip_path, 'r') as ann_zip:
+            ann_files = ann_zip.namelist()
+
+        for name in img_files:
             if name.endswith('_leftImg8bit.png') and f'leftImg8bit/{split}/' in name:
                 base = os.path.basename(name).replace('_leftImg8bit.png', '')
                 city = os.path.basename(os.path.dirname(name))
                 json_name = f'gtCoarse/{split}/{city}/{base}_gtCoarse_polygons.json'
-                if json_name in self.ann_zip.namelist():
+                if json_name in ann_files:
                     self.samples.append((name, json_name))
 
     def __len__(self):
@@ -99,33 +103,29 @@ class LostAndFoundFromZip(Dataset):
     def __getitem__(self, index):
         img_path, ann_path = self.samples[index]
 
-        # Load image
-        image_bytes = self.img_zip.read(img_path)
+        with zipfile.ZipFile(self.img_zip_path, 'r') as img_zip:
+            image_bytes = img_zip.read(img_path)
         image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
 
-        # Load annotation
-        ann_bytes = self.ann_zip.read(ann_path)
+        with zipfile.ZipFile(self.ann_zip_path, 'r') as ann_zip:
+            ann_bytes = ann_zip.read(ann_path)
         ann_data = json.loads(ann_bytes)
 
-        # Create empty mask (inizialmente ignorato - 255)
-        mask = Image.new('L', image.size, 255)
+        # Maschera binaria: 0 = normale, 1 = anomalia
+        mask = Image.new('L', image.size, 0)
         draw = ImageDraw.Draw(mask)
 
-        # Disegna ogni poligono con il train_id corretto
+        NORMAL_CLASSES = {'free', 'road', 'unlabeled', 'ego vehicle', 'rectification border', 'out of roi', 'background'}  # considera normali
+
         for obj in ann_data['objects']:
             label = obj['label']
-            # Trova train_id usando le classi Cityscapes
-            train_id = 255  # default ignore
-            for cls in classes:
-                if cls.name == label:
-                    train_id = cls.train_id
-                    break
+            is_anomaly = label not in NORMAL_CLASSES
+            fill_value = 1 if is_anomaly else 0
             polygon = [tuple(point) for point in obj['polygon']]
-            draw.polygon(polygon, fill=train_id)
+            draw.polygon(polygon, fill=fill_value)
 
         mask = np.array(mask, dtype=np.uint8)
 
-        # opzionale: applica la trasformazione
         if self.transform:
             image, mask = self.transform(image, mask)
 
