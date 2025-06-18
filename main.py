@@ -8,7 +8,7 @@ import numpy as np
 import json
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes, my_dataset, cityscapes_mod
+from datasets import VOCSegmentation, Cityscapes, cityscapes_mod, lostandfound
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
 
@@ -80,8 +80,12 @@ def get_argparser():
     # Datset Options
     parser.add_argument("--data_root", type=str, default='./datasets/data',
                         help="path to Dataset")
+    parser.add_argument("--img_zip_path", type=str, default='./datasets/data',
+                        help="path to Dataset")
+    parser.add_argument("--ann_zip_path", type=str, default='./datasets/data',
+                        help="path to Dataset")
     parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes', 'my'], help='Name of dataset')
+                        choices=['voc', 'cityscapes', 'my', 'lostandfound'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
 
@@ -228,6 +232,17 @@ def get_dataset(opts):
         train_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='train', transform=train_transform)
         val_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='val', transform=val_transform)
 
+    if opts.dataset == 'lostandfound':
+        # Trasformazioni per LostAndFound, puoi modificarle secondo il dataset
+        val_transform = et.ExtCompose([
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        train_dst = None  # se non usi training su LostAndFound
+        val_dst = lostandfound.LostAndFoundFromZip(img_zip_path=opts.img_zip_path, ann_zip_path=opts.ann_zip_path, split='test', transform=val_transform)
+
     return train_dst, val_dst
 
 
@@ -324,6 +339,8 @@ def main():
         opts.num_classes = 19
     elif opts.dataset.lower() == 'my':
         opts.num_classes = 19 + 1
+    elif opts.dataset.lower() == 'lostandfound':
+        opts.num_classes = 19 + 1
 
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
@@ -345,13 +362,22 @@ def main():
         opts.val_batch_size = 1
 
     train_dst, val_dst = get_dataset(opts)
-    train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
-    val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
-    print("Dataset: %s, Train set: %d, Val set: %d" %
-          (opts.dataset, len(train_dst), len(val_dst)))
+    if train_dst is not None:
+        train_loader = data.DataLoader(
+            train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+            drop_last=True)  # drop_last=True to ignore single-image batches.
+    else:
+        train_loader = None
+    if opts.dataset.lower() == 'lostandfound':
+        val_loader = data.DataLoader(
+            val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=0)
+    else:
+        val_loader = data.DataLoader(
+            val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+    print("Dataset: %s, Train set: %s, Val set: %d" % (
+    opts.dataset,
+    len(train_dst) if train_dst is not None else 'N/A',
+    len(val_dst)))
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
@@ -374,36 +400,45 @@ def main():
     elif opts.lr_policy == 'step':
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
 
-    # === Calcolo automatico dei pesi di classe ===
-    print("Calcolo pesi per CrossEntropyLoss...")
+    if train_dst is not None:
+        # === Calcolo automatico dei pesi di classe ===
+        print("Calcolo pesi per CrossEntropyLoss...")
 
-    class_counts = torch.zeros(opts.num_classes)
-    total_pixels = 0
+        class_counts = torch.zeros(opts.num_classes)
+        total_pixels = 0
 
-    tmp_loader = data.DataLoader(train_dst, batch_size=1, shuffle=False)
+        tmp_loader = data.DataLoader(train_dst, batch_size=1, shuffle=False)
 
-    for _, label in tqdm(tmp_loader, desc="Scanning dataset"):
-        label = label.squeeze()  # [H, W]
-        for cls in range(opts.num_classes):
-            class_counts[cls] += torch.sum(label == cls).item()
-        total_pixels += label.numel()
+        for _, label in tqdm(tmp_loader, desc="Scanning dataset"):
+            label = label.squeeze()  # [H, W]
+            for cls in range(opts.num_classes):
+                class_counts[cls] += torch.sum(label == cls).item()
+            total_pixels += label.numel()
 
-    # Frequenza inversa normalizzata
-    class_freq = class_counts / total_pixels
-    weights = 1.0 / (class_freq + 1e-6)  # evita divisione per zero
-    weights = weights / weights.sum() * opts.num_classes  # normalizzazione (opzionale)
+        # Frequenza inversa normalizzata
+        class_freq = class_counts / total_pixels
+        weights = 1.0 / (class_freq + 1e-6)  # evita divisione per zero
+        weights = weights / weights.sum() * opts.num_classes  # normalizzazione (opzionale)
 
-    print("Class weights:", weights)
-    weights = weights.to(device)
+        print("Class weights:", weights)
+        weights = weights.to(device)
+    else:
+        weights = None
 
     # Set up criterion
     # criterion = utils.get_loss(opts.loss_type)
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, weight=weights, reduction='mean')
+        if weights is not None:
+            criterion = nn.CrossEntropyLoss(ignore_index=255, weight=weights, reduction='mean')
+        else:
+            criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
     elif opts.loss_type == 'boundary':
-        criterion = BoundaryAwareCrossEntropyLoss(weight=weights, ignore_index=255, boundary_weight=5.0)
+        if weights is not None:
+            criterion = BoundaryAwareCrossEntropyLoss(weight=weights, ignore_index=255, boundary_weight=5.0)
+        else:
+            criterion = BoundaryAwareCrossEntropyLoss(ignore_index=255, boundary_weight=5.0)
 
     def save_ckpt(path):
         """ save current model
@@ -469,6 +504,35 @@ def main():
             opts=opts, model=model, loader=val_loader, device=device,
             metrics=metrics, ret_samples_ids=vis_sample_id)
         print(metrics.to_str(val_score))
+
+        import numpy as np
+        from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+
+        all_pred_scores = []
+        all_gt_labels = []
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)  # [B, C, H, W]
+
+                probs = torch.softmax(outputs, dim=1)[:, 1, :, :]  # Cambia l'indice se serve
+
+                all_pred_scores.append(probs.view(-1).cpu())
+                all_gt_labels.append(labels.view(-1).cpu())
+
+        all_pred_scores = torch.cat(all_pred_scores).numpy()
+        all_gt_labels = torch.cat(all_gt_labels).numpy()
+
+        roc_auc = roc_auc_score(all_gt_labels, all_pred_scores)
+        precision, recall, _ = precision_recall_curve(all_gt_labels, all_pred_scores)
+        pr_auc = auc(recall, precision)
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+        f1_max = np.max(f1_scores)
+
+        print(f"Anomaly Detection Metrics:\nROC-AUC: {roc_auc:.4f}\nPR-AUC: {pr_auc:.4f}\nMax F1: {f1_max:.4f}")
+
         return
 
     interval_loss = 0
