@@ -213,7 +213,7 @@ def get_dataset(opts):
         val_dst = Cityscapes(root=opts.data_root,
                              split='val', transform=val_transform)
 
-    if opts.dataset == 'my':
+    """if opts.dataset == 'my':
         train_transform = et.ExtCompose([
             et.ExtResize((96, 256)),
             et.ExtRandomCrop(size=(96, 256), pad_if_needed=True),
@@ -234,104 +234,72 @@ def get_dataset(opts):
         ])
 
         train_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='train', transform=train_transform)
-        val_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='val', transform=val_transform)
+        val_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='val', transform=val_transform)"""
 
     if opts.dataset == 'lostandfound':
         # Trasformazioni per LostAndFound, puoi modificarle secondo il dataset
+        train_transform = et.ExtCompose([
+            # et.ExtResize( 512 ),
+            et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
+            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
+            et.ExtRandomHorizontalFlip(),
+            et.ExtToTensor(),
+            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
         val_transform = et.ExtCompose([
             et.ExtToTensor(),
             et.ExtNormalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
         ])
 
-        train_dst = None  # se non usi training su LostAndFound
-        val_dst = lostandfound.LostAndFoundFromZip(img_zip_path=opts.img_zip_path, ann_zip_path=opts.ann_zip_path, split='test', transform=val_transform)
+        train_dst = lostandfound.LostAndFoundDatasetFromMasks(root=opts.data_root, split='train', transform=train_transform)  # se non usi training su LostAndFound
+        val_dst = lostandfound.LostAndFoundDatasetFromMasks(root=opts.data_root, split='test', transform=val_transform)
 
     return train_dst, val_dst
 
 
 def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
-    """Do validation and return specified samples"""
+    """Do validation and return specified samples (senza salvataggio immagini)"""
     metrics.reset()
     ret_samples = []
-    if opts.save_val_results:
-        if not os.path.exists('results'):
-            os.mkdir('results')
-        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-        img_id = 0
 
-    threshold = getattr(opts, 'calibrated_threshold', 0.2)  # soglia per considerare un pixel come "unknown"
-    unknown_label = opts.num_classes - 1  # ultima classe = unknown
+    threshold = getattr(opts, 'calibrated_threshold', 0.2)
+    unknown_label = opts.num_classes - 1
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
-
+        for i, (images, labels) in tqdm(enumerate(loader), total=len(loader)):
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
             outputs = model(images)
             softmax = torch.nn.functional.softmax(outputs, dim=1)
-            confidence, _ = torch.max(softmax, dim=1)  # [B, H, W]
-            preds = outputs.detach().max(dim=1)[1]     # [B, H, W]
+            confidence, _ = torch.max(softmax, dim=1)
+            preds = outputs.detach().max(dim=1)[1]
 
-            # Etichetta i pixel con bassa confidenza come "unknown"
+            # Mark pixels as unknown if below threshold
             unknown_mask = confidence < threshold
             preds[unknown_mask] = unknown_label
+
             num_unknown = unknown_mask.sum().item()
             total_pixels = unknown_mask.numel()
             perc_unknown = 100 * num_unknown / total_pixels
-            print(f"[DEBUG] Unknown pixels: {num_unknown} ({perc_unknown:.2f}%)")
+            #print(f"[DEBUG] Unknown pixels: {num_unknown} ({perc_unknown:.2f}%)")
 
             preds_np = preds.cpu().numpy()
             targets = labels.cpu().numpy()
 
-            # FILTRAGGIO: ignora i pixel 'unknown' nel calcolo metriche
-            valid_mask = targets != unknown_label  # True dove target != unknown
-
-            # Appiattisci e filtra solo pixel validi (batch, h, w → vettore)
+            valid_mask = targets != unknown_label
             targets_filtered = targets[valid_mask]
             preds_filtered = preds_np[valid_mask]
 
             metrics.update(targets_filtered, preds_filtered)
 
             if ret_samples_ids is not None and i in ret_samples_ids:
-                ret_samples.append(
-                    (images[0].detach().cpu().numpy(), targets[0], preds_np[0]))
+                ret_samples.append((images[0].cpu().numpy(), targets[0], preds_np[0]))
 
-            if opts.save_val_results:
-                for j in range(len(images)):  # correggo da i a j per evitare sovrascrittura ciclo
-                    image = images[j].detach().cpu().numpy()
-                    target = targets[j]
-                    pred = preds_np[j]
-                    conf_map = confidence[j].cpu().numpy()
-                    unk_mask = unknown_mask[j].cpu().numpy()
-
-                    image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
-                    target_vis = loader.dataset.decode_target(target).astype(np.uint8)
-                    pred_vis = loader.dataset.decode_target(pred).astype(np.uint8)
-
-                    # Heatmap confidenza
-                    plt.imshow(conf_map, cmap='hot')
-                    plt.colorbar()
-                    plt.title("Confidence Heatmap")
-                    plt.savefig(f'results/{img_id}_conf_heatmap.png')
-                    plt.close()
-
-                    # Overlay ostacoli sconosciuti
-                    overlay = np.zeros_like(image)
-                    overlay[unk_mask] = [255, 0, 0]
-                    blend = np.clip(0.6 * image + 0.4 * overlay, 0, 255).astype(np.uint8)
-
-                    # Salvataggio immagini
-                    Image.fromarray(image).save(f'results/{img_id}_image.png')
-                    Image.fromarray(target_vis).save(f'results/{img_id}_target.png')
-                    Image.fromarray(pred_vis).save(f'results/{img_id}_pred.png')
-                    Image.fromarray(blend).save(f'results/{img_id}_unknown_overlay.png')
-
-                    img_id += 1
-
-        score = metrics.get_results()
+    score = metrics.get_results()
     return score, ret_samples
 
 
@@ -341,8 +309,6 @@ def main():
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
-    elif opts.dataset.lower() == 'my':
-        opts.num_classes = 19 + 1
     elif opts.dataset.lower() == 'lostandfound':
         opts.num_classes = 19 + 1
 
@@ -372,11 +338,8 @@ def main():
             drop_last=True)  # drop_last=True to ignore single-image batches.
     else:
         train_loader = None
-    if opts.dataset.lower() == 'lostandfound':
-        val_loader = data.DataLoader(
-            val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=0)
-    else:
-        val_loader = data.DataLoader(
+
+    val_loader = data.DataLoader(
             val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
         
     if len(val_loader) == 0:
@@ -470,22 +433,22 @@ def main():
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         
 
-        if opts.dataset.lower() == 'lostandfound':
+        """if opts.dataset.lower() == 'lostandfound':
             checkpoint = torch.load(opts.ckpt, map_location=device)
             model.load_state_dict(checkpoint['model_state'], strict=True)
             model = nn.DataParallel(model)
             model.to(device)
-        else:
-            checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
-            model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
-            # Carica solo i pesi del backbone e del resto tranne la testa
-            state_dict = checkpoint['model_state']
-            filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
-            model.load_state_dict(filtered_dict, strict=False)
+        else:"""
+        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
+        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+        # Carica solo i pesi del backbone e del resto tranne la testa
+        state_dict = checkpoint['model_state']
+        filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
+        model.load_state_dict(filtered_dict, strict=False)
 
-            # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
-            model = nn.DataParallel(model)
-            model.to(device)
+        # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
+        model = nn.DataParallel(model)
+        model.to(device)
 
 
         optimizer = torch.optim.SGD(params=[
@@ -531,11 +494,16 @@ def main():
                 images = images.to(device)
                 labels = labels.to(device)
                 outputs = model(images)  # [B, C, H, W]
+                probs = torch.softmax(outputs, dim=1)  # [B, C, H, W]
+                confidence = torch.max(probs, dim=1)  # [B, H, W]
 
-                probs = torch.softmax(outputs, dim=1)[:, 1, :, :]  # Cambia l'indice se serve
+                # Anomaly mask: confidenza sotto la soglia
+                anomaly_scores = (1.0 - confidence).view(-1).cpu()  # inverso: più alto = più anomalo
+                all_pred_scores.append(anomaly_scores)
 
-                all_pred_scores.append(probs.view(-1).cpu())
-                all_gt_labels.append(labels.view(-1).cpu())
+                # GT anomaly: label == 20 (o qualsiasi classe "anomala")
+                gt_anomaly_mask = (labels == 20).view(-1).cpu().int()
+                all_gt_labels.append(gt_anomaly_mask)
 
         all_pred_scores = torch.cat(all_pred_scores).numpy()
         all_gt_labels = torch.cat(all_gt_labels).numpy()

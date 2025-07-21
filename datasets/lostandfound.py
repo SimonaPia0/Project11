@@ -1,10 +1,6 @@
-import zipfile
-import io
 import os
-import json
 import numpy as np
-from PIL import Image, ImageDraw
-import torch
+from PIL import Image
 from torch.utils.data import Dataset
 from collections import namedtuple
 
@@ -75,56 +71,31 @@ def decode_target(train_id_mask):
     mask[mask == 255] = len(train_id_to_color) - 1  # ignora -> nero
     return train_id_to_color[mask]
 
-
-class LostAndFoundFromZip(Dataset):
-    def __init__(self, img_zip_path, ann_zip_path, split='test', transform=None):
-        self.img_zip_path = img_zip_path
-        self.ann_zip_path = ann_zip_path
-        self.transform = transform
+class LostAndFoundDatasetFromMasks(Dataset):
+    def __init__(self, root, split='train', transform=None):
+        self.root = root
         self.split = split
-        self.samples = []
+        self.transform = transform
 
-        with zipfile.ZipFile(self.img_zip_path, 'r') as img_zip:
-            img_files = img_zip.namelist()
-        with zipfile.ZipFile(self.ann_zip_path, 'r') as ann_zip:
-            ann_files = ann_zip.namelist()
+        self.img_dir = os.path.join(root, split, 'images')
+        self.mask_dir = os.path.join(root, split, 'masks')
 
-        for name in img_files:
-            if name.endswith('_leftImg8bit.png') and f'leftImg8bit/{split}/' in name:
-                base = os.path.basename(name).replace('_leftImg8bit.png', '')
-                city = os.path.basename(os.path.dirname(name))
-                json_name = f'gtCoarse/{split}/{city}/{base}_gtCoarse_polygons.json'
-                if json_name in ann_files:
-                    self.samples.append((name, json_name))
+        # Carica tutti i file immagine (assumendo .png o .jpg)
+        self.images = sorted([f for f in os.listdir(self.img_dir) if f.endswith(('.png', '.jpg'))])
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.images)
 
     def __getitem__(self, index):
-        img_path, ann_path = self.samples[index]
+        img_name = self.images[index]
+        img_path = os.path.join(self.img_dir, img_name)
 
-        with zipfile.ZipFile(self.img_zip_path, 'r') as img_zip:
-            image_bytes = img_zip.read(img_path)
-        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        # Supponiamo che la maschera abbia lo stesso nome con _mask
+        mask_name = img_name
+        mask_path = os.path.join(self.mask_dir, mask_name)
 
-        with zipfile.ZipFile(self.ann_zip_path, 'r') as ann_zip:
-            ann_bytes = ann_zip.read(ann_path)
-        ann_data = json.loads(ann_bytes)
-
-        # Maschera binaria: 0 = normale, 1 = anomalia
-        mask = Image.new('L', image.size, 0)
-        draw = ImageDraw.Draw(mask)
-
-        NORMAL_CLASSES = {'free', 'road', 'unlabeled', 'ego vehicle', 'rectification border', 'out of roi', 'background'}  # considera normali
-
-        for obj in ann_data['objects']:
-            label = obj['label']
-            is_anomaly = label not in NORMAL_CLASSES
-            fill_value = 1 if is_anomaly else 0
-            polygon = [tuple(point) for point in obj['polygon']]
-            draw.polygon(polygon, fill=fill_value)
-
-        mask = np.array(mask, dtype=np.uint8)
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # scala di grigi
 
         if self.transform:
             image, mask = self.transform(image, mask)
