@@ -101,11 +101,15 @@ class LostAndFoundDatasetFromMasks(Dataset):
         mask_np = np.array(mask)
         mask_train_id = encode_target(mask_np)
 
-        # Se usi trasformazioni, applicale all'immagine e alla maschera train_id
-        if self.transform:
-            image, mask_train_id = self.transform(image, mask_train_id)
+        mask_img = Image.fromarray(mask_train_id.astype(np.uint8))
 
-        # Converti mask_train_id in tensor prima di restituirlo
+        if self.transform:
+            image, mask_img = self.transform(image, mask_img)
+
+        # Dopo la trasformazione, riconverti in numpy array
+        mask_train_id = np.array(mask_img)
+
+        # Converti in tensor
         mask_train_id = torch.from_numpy(mask_train_id).long()
 
         return image, mask_train_id
