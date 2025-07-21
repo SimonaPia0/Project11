@@ -47,7 +47,7 @@ classes = [
     CityscapesClass('motorcycle',           32,17,  'vehicle', 7, True,  False, (0, 0, 230)),
     CityscapesClass('bicycle',              33,18,  'vehicle', 7, True,  False, (119, 11, 32)),
     CityscapesClass('license plate',        -1,255, 'vehicle', 7, False, True, (0, 0, 142)),
-    CityscapesClass('unknown',              255,20,  'void', 0, False, False, (255, 0, 0)),
+    CityscapesClass('unknown',              255,19,  'void', 0, False, False, (255, 0, 0)),
 ]
 
 train_id_to_color = [c.color for c in classes if (c.train_id != -1 and c.train_id != 255)]

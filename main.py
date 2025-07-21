@@ -502,7 +502,7 @@ def main():
                 all_pred_scores.append(anomaly_scores)
 
                 # GT anomaly: label == 20 (o qualsiasi classe "anomala")
-                gt_anomaly_mask = (labels == 20).view(-1).cpu().int()
+                gt_anomaly_mask = (labels == 19).view(-1).cpu().int()
                 all_gt_labels.append(gt_anomaly_mask)
 
         all_pred_scores = torch.cat(all_pred_scores).numpy()
