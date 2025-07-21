@@ -495,7 +495,7 @@ def main():
                 labels = labels.to(device)
                 outputs = model(images)  # [B, C, H, W]
                 probs = torch.softmax(outputs, dim=1)  # [B, C, H, W]
-                confidence = torch.max(probs, dim=1)  # [B, H, W]
+                confidence, preds = torch.max(probs, dim=1)  # [B, H, W]
 
                 # Anomaly mask: confidenza sotto la soglia
                 anomaly_scores = (1.0 - confidence).view(-1).cpu()  # inverso: più alto = più anomalo

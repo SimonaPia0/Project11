@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from collections import namedtuple
@@ -97,7 +98,14 @@ class LostAndFoundDatasetFromMasks(Dataset):
         image = Image.open(img_path).convert('RGB')
         mask = Image.open(mask_path).convert('L')  # scala di grigi
 
-        if self.transform:
-            image, mask = self.transform(image, mask)
+        mask_np = np.array(mask)
+        mask_train_id = encode_target(mask_np)
 
-        return image, mask
+        # Se usi trasformazioni, applicale all'immagine e alla maschera train_id
+        if self.transform:
+            image, mask_train_id = self.transform(image, mask_train_id)
+
+        # Converti mask_train_id in tensor prima di restituirlo
+        mask_train_id = torch.from_numpy(mask_train_id).long()
+
+        return image, mask_train_id
