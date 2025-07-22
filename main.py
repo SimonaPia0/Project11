@@ -8,7 +8,7 @@ import numpy as np
 import json
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes, cityscapes_mod, lostandfound
+from datasets import VOCSegmentation, Cityscapes, lostandfound
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
 
@@ -51,8 +51,8 @@ class BoundaryAwareCrossEntropyLoss(nn.Module):
         return loss
 
 def calibra_soglia_confidenza(model, loader, device, percentile=10):
-    """Stima una soglia di confidenza MSP con conformal prediction (percentile su pixel corretti)."""
-    print("[INFO] Calibrazione soglia conformal prediction...")
+    """Estimate confidence threshold of MSP with conformal prediction."""
+    print("[INFO] Calibration threshold conformal prediction...")
     model.eval()
     conf_list = []
 
@@ -71,11 +71,11 @@ def calibra_soglia_confidenza(model, loader, device, percentile=10):
             conf_list.extend(conf_np[correct])  # solo confidenza sui pixel corretti
 
     if len(conf_list) == 0:
-        print("[WARNING] Nessuna confidenza raccolta (conf_list è vuoto). Restituisco soglia di default = 0.5")
+        print("[WARNING] No confidence found (conf_list empty). Default threshold = 0.5")
         return 0.5
 
     threshold = np.percentile(conf_list, percentile)
-    print(f"[INFO] Soglia CP al {100 - percentile}% di affidabilità: {threshold:.3f}")
+    print(f"[INFO] Threshold CP at {100 - percentile}% of reliability: {threshold:.3f}")
     return threshold
 
 def get_argparser():
@@ -213,31 +213,7 @@ def get_dataset(opts):
         val_dst = Cityscapes(root=opts.data_root,
                              split='val', transform=val_transform)
 
-    """if opts.dataset == 'my':
-        train_transform = et.ExtCompose([
-            et.ExtResize((96, 256)),
-            et.ExtRandomCrop(size=(96, 256), pad_if_needed=True),
-            et.ExtColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-            et.ExtRandomHorizontalFlip(p=0.5),
-            et.ExtRandomVerticalFlip(p=0.2),
-            #et.ExtGaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
-            et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-        val_transform = et.ExtCompose([
-            # et.ExtResize( 512 ),
-            et.ExtRandomCrop(size=(96, 256)),
-            et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-        ])
-
-        train_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='train', transform=train_transform)
-        val_dst = cityscapes_mod.Cityscapes_Mod(root=opts.data_root, split='val', transform=val_transform)"""
-
     if opts.dataset == 'lostandfound':
-        # Trasformazioni per LostAndFound, puoi modificarle secondo il dataset
         train_transform = et.ExtCompose([
             # et.ExtResize( 512 ),
             et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
@@ -254,7 +230,7 @@ def get_dataset(opts):
                             std=[0.229, 0.224, 0.225]),
         ])
 
-        train_dst = lostandfound.LostAndFoundDatasetFromMasks(root=opts.data_root, split='train', transform=train_transform)  # se non usi training su LostAndFound
+        train_dst = lostandfound.LostAndFoundDatasetFromMasks(root=opts.data_root, split='train', transform=train_transform)  
         val_dst = lostandfound.LostAndFoundDatasetFromMasks(root=opts.data_root, split='test', transform=val_transform)
 
     return train_dst, val_dst
@@ -285,7 +261,6 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
             num_unknown = unknown_mask.sum().item()
             total_pixels = unknown_mask.numel()
             perc_unknown = 100 * num_unknown / total_pixels
-            #print(f"[DEBUG] Unknown pixels: {num_unknown} ({perc_unknown:.2f}%)")
 
             preds_np = preds.cpu().numpy()
             targets = labels.cpu().numpy()
@@ -310,7 +285,7 @@ def main():
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
     elif opts.dataset.lower() == 'lostandfound':
-        opts.num_classes = 19 + 1
+        opts.num_classes = 2
 
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
@@ -365,16 +340,15 @@ def main():
         {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
         {'params': model.classifier.parameters(), 'lr': opts.lr},
     ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
+
     if opts.lr_policy == 'poly':
         scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
     elif opts.lr_policy == 'step':
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
 
     if train_dst is not None:
-        # === Calcolo automatico dei pesi di classe ===
-        print("Calcolo pesi per CrossEntropyLoss...")
+        # Compute loss weights
+        print("Compute loss weights...")
 
         class_counts = torch.zeros(opts.num_classes)
         total_pixels = 0
@@ -387,10 +361,10 @@ def main():
                 class_counts[cls] += torch.sum(label == cls).item()
             total_pixels += label.numel()
 
-        # Frequenza inversa normalizzata
+        # Normalized inverse frequency
         class_freq = class_counts / total_pixels
-        weights = 1.0 / (class_freq + 1e-6)  # evita divisione per zero
-        weights = weights / weights.sum() * opts.num_classes  # normalizzazione (opzionale)
+        weights = 1.0 / (class_freq + 1e-6)  
+        weights = weights / weights.sum() * opts.num_classes  # normalization
 
         print("Class weights:", weights)
         weights = weights.to(device)
@@ -398,7 +372,6 @@ def main():
         weights = None
 
     # Set up criterion
-    # criterion = utils.get_loss(opts.loss_type)
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
@@ -441,12 +414,11 @@ def main():
         else:"""
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
         model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
-        # Carica solo i pesi del backbone e del resto tranne la testa
+        # Loading backbone
         state_dict = checkpoint['model_state']
         filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.classifier.3')}
         model.load_state_dict(filtered_dict, strict=False)
 
-        # Metti la testa con il numero di classi corretto (già fatta al momento della creazione del modello)
         model = nn.DataParallel(model)
         model.to(device)
 
@@ -476,7 +448,7 @@ def main():
     denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
 
     if opts.test_only:
-        # Calibrazione soglia CP
+        # Calibration CP
         threshold_cp = calibra_soglia_confidenza(model, val_loader, device, percentile=10)
         opts.calibrated_threshold = threshold_cp
 
@@ -497,12 +469,12 @@ def main():
                 probs = torch.softmax(outputs, dim=1)  # [B, C, H, W]
                 confidence, preds = torch.max(probs, dim=1)  # [B, H, W]
 
-                # Anomaly mask: confidenza sotto la soglia
-                anomaly_scores = (1.0 - confidence).view(-1).cpu()  # inverso: più alto = più anomalo
-                all_pred_scores.append(anomaly_scores)
+                valid_mask = (labels != 255).view(-1)  # filter ignore pixels
 
-                # GT anomaly: label == 20 (o qualsiasi classe "anomala")
-                gt_anomaly_mask = (labels == 19).view(-1).cpu().int()
+                anomaly_scores = (1.0 - confidence).view(-1)[valid_mask].cpu()
+                gt_anomaly_mask = (labels == 1).view(-1)[valid_mask].cpu().int()
+
+                all_pred_scores.append(anomaly_scores)
                 all_gt_labels.append(gt_anomaly_mask)
 
         all_pred_scores = torch.cat(all_pred_scores).numpy()
@@ -519,7 +491,7 @@ def main():
         return
 
     interval_loss = 0
-    while True:  # cur_itrs < opts.total_itrs:
+    while True:  
         # =====  Train  =====
         model.train()
         cur_epochs += 1

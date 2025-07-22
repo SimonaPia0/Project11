@@ -51,25 +51,25 @@ classes = [
 ]
 
 train_id_to_color = [c.color for c in classes if (c.train_id != -1 and c.train_id != 255)]
-train_id_to_color.append([0, 0, 0])  # colore per ignore
+train_id_to_color.append([0, 0, 0])  # color for ignore
 train_id_to_color = np.array(train_id_to_color)
 
 id_to_train_id = np.array([c.train_id for c in classes])
 
-# Mappa da id originali a train_id (256 valori)
+# Map from original id to train_id (256 values)
 full_id_to_train_id = np.ones(256, dtype=np.uint8) * 255
 for cls_ in classes:
     if 0 <= cls_.id < 256:
         full_id_to_train_id[cls_.id] = cls_.train_id
 
 def encode_target(mask):
-    """Converti maschera con id originali in maschera con train_id."""
+    """Convert mask with original id to mask with train_id."""
     return full_id_to_train_id[mask]
 
 def decode_target(train_id_mask):
-    """Converti maschera train_id in maschera RGB colore."""
+    """Convert mask train_id in mask RGB."""
     mask = train_id_mask.copy()
-    mask[mask == 255] = len(train_id_to_color) - 1  # ignora -> nero
+    mask[mask == 255] = len(train_id_to_color) - 1  # ignore -> black
     return train_id_to_color[mask]
 
 class LostAndFoundDatasetFromMasks(Dataset):
@@ -81,7 +81,7 @@ class LostAndFoundDatasetFromMasks(Dataset):
         self.img_dir = os.path.join(root, split, 'images')
         self.mask_dir = os.path.join(root, split, 'masks')
 
-        # Carica tutti i file immagine (assumendo .png o .jpg)
+        # Load image file
         self.images = sorted([f for f in os.listdir(self.img_dir) if f.endswith(('.png', '.jpg'))])
 
     def __len__(self):
@@ -91,25 +91,13 @@ class LostAndFoundDatasetFromMasks(Dataset):
         img_name = self.images[index]
         img_path = os.path.join(self.img_dir, img_name)
 
-        # Supponiamo che la maschera abbia lo stesso nome con _mask
         mask_name = img_name
         mask_path = os.path.join(self.mask_dir, mask_name)
 
         image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')  # scala di grigi
-
-        mask_np = np.array(mask)
-        mask_train_id = encode_target(mask_np)
-
-        mask_img = Image.fromarray(mask_train_id.astype(np.uint8))
+        mask = Image.open(mask_path).convert('L')  
 
         if self.transform:
-            image, mask_img = self.transform(image, mask_img)
+            image, mask = self.transform(image, mask)  
 
-        # Dopo la trasformazione, riconverti in numpy array
-        mask_train_id = np.array(mask_img)
-
-        # Converti in tensor
-        mask_train_id = torch.from_numpy(mask_train_id).long()
-
-        return image, mask_train_id
+        return image, mask
