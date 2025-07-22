@@ -8,5 +8,9 @@ A pipeline for semantic segmentation of unexpected obstacles on the road using t
 ## Checkpoints
 You can find the needed checkpoints at this link: https://drive.google.com/drive/folders/1sbtpxwX9yqNjTYMGUIvyFyxBZ7_Co_AP?usp=drive_link
 Download the checkpoints and put them in the checkpoints folder.
+## Modified files
+- main.py
+- preprocessing.py
+- datasets/lostandfound.py
 ## Important
 In the main branch there are README file and the presentation, instead the code is in the master branch.
